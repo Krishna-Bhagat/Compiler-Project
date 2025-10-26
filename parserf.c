@@ -104,7 +104,13 @@ Node *parse_expression(Token *current_token, Node *current_node)
 {
     (void)current_node;
     if (!current_token)
-        return NULL;
+    {
+        print_error("Unexpected NULL token", 0);
+    }
+    if (!current_node)
+    {
+        print_error("Unexpected NULL node", 0);
+    }
 
     // First operand
     if (current_token->type == END_OF_TOKENS)
@@ -151,13 +157,11 @@ Token *generate_operation_nodes(Token *current_token, Node *current_node)
     current_node = oper_node;
 
     // Move to previous token safely (for left operand)
-    if (current_token > 0)
+    // Instead of if (current_token > 0)
+    if (current_token != NULL && current_token != (Token *)-1)
         current_token--;
     else
-    {
-        fprintf(stderr, "ERROR: Missing operand before operator\n");
-        exit(1);
-    }
+        print_error("Missing operand before operator", 0);
 
     if (current_token && current_token->type == INT)
     {
@@ -190,40 +194,8 @@ Token *generate_operation_nodes(Token *current_token, Node *current_node)
         exit(1);
     }
 
-    /* Continue parsing sequences like: OP (right) OP (right) ... */
-    while (current_token && current_token->type != END_OF_TOKENS)
-    {
-        if (current_token->type == OPERATOR)
-        {
-            Node *next_oper_node = init_node(NULL, current_token->value, OPERATOR);
-            current_node->right = next_oper_node;
-            current_node = next_oper_node;
-
-            /* next token must be INT or IDENTIFIER */
-            current_token++;
-            if (!current_token || current_token->type == END_OF_TOKENS)
-            {
-                fprintf(stderr, "ERROR: expected operand after operator\n");
-                exit(1);
-            }
-            if (current_token->type == INT || current_token->type == IDENTIFIER)
-            {
-                current_node->left = init_node(NULL, current_token->value, current_token->type);
-                current_token++;
-            }
-            else
-            {
-                fprintf(stderr, "ERROR: expected INT or IDENTIFIER after operator\n");
-                exit(1);
-            }
-        }
-        else
-        {
-            /* token is not an operator, stop operation parsing */
-            break;
-        }
-    }
-
+    /* For simple expressions like a + b, we don't need to continue parsing */
+    /* Break after handling the first complete expression */
     return current_token;
 }
 
@@ -298,8 +270,18 @@ void handle_token_errors(char *error_text, Token *current_token, TokenType type)
 
 Node *create_variable_reusage(Token *current_token, Node *current)
 {
+    static int depth = 0;
+    if (depth > 50)
+    { // Prevent deep recursion
+        print_error("Expression too complex or possible recursion", 0);
+    }
+    depth++;
+
     if (!current_token || !current)
         print_error("Internal parser error: null token or node", 0);
+
+    if (!current_token->value)
+        print_error("Invalid token: missing value", 0);
 
     /* Create main identifier node and attach */
     Node *main_identifier_node = init_node(NULL, current_token->value, IDENTIFIER);
@@ -759,7 +741,7 @@ Node *parser(Token *tokens)
             {
                 if (strcmp(current_token->value, "EXIT") == 0)
                 {
-                    current = handle_exit_syscall(current_token, current);
+                    current = handle_exit_syscall(root, current_token, current);
                 }
                 else if (strcmp(current_token->value, "INT") == 0)
                 {
@@ -771,7 +753,10 @@ Node *parser(Token *tokens)
                 }
                 else if (strcmp(current_token->value, "WHILE") == 0)
                 {
-                    current = create_if_statement(current_token, current);
+                    // Create a specialized WHILE node but reuse IF condition parsing logic
+                    Node *while_node = init_node(NULL, current_token->value, current_token->type);
+                    current->left = while_node;
+                    current = create_if_statement(current_token, while_node);
                 }
                 else if (strcmp(current_token->value, "WRITE") == 0)
                 {
@@ -815,11 +800,19 @@ Node *parser(Token *tokens)
 
         default:
             // Other token types can be ignored or handled separately if needed
+            current_token++; // Advance token for unhandled types
             break;
         }
 
-        current_token++;
+        // Special handling to advance token for non-keyword/non-separator tokens
+        if (current_token->type != KEYWORD && current_token->type != SEPARATOR &&
+            current_token->type != IDENTIFIER)
+        {
+            current_token++;
+        }
     }
 
+    // Clean up stack before returning
+    free(stack);
     return root;
 }

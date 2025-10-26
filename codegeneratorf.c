@@ -83,7 +83,12 @@ void stack_push(size_t value)
 {
   if (current_stack_size_size >= MAX_STACK_SIZE_SIZE)
   {
-    fprintf(stderr, "ERROR: stack overflow\n");
+    fprintf(stderr, "ERROR: stack overflow (max size %d)\n", MAX_STACK_SIZE_SIZE);
+    exit(1);
+  }
+  if (value > 10000) // Add reasonability check
+  {
+    fprintf(stderr, "ERROR: Attempting to push suspiciously large value %zu\n", value);
     exit(1);
   }
   current_stack_size[current_stack_size_size++] = value;
@@ -257,14 +262,25 @@ int mov_if_var_or_not(char *reg, Node *node, FILE *file)
 
 Node *generate_operator_code(Node *node, FILE *file)
 {
+  static int op_depth = 0;
+
   if (node == NULL)
   {
     printf("ERROR: Null node passed to generate_operator_code\n");
     exit(1);
   }
 
+  op_depth++;
+  if (op_depth > 50) // Prevent deep operator chains
+  {
+    printf("ERROR: Operation chain too deep (>50), possible infinite recursion\n");
+    exit(1);
+  }
+
   // Move left operand into RAX
   mov_if_var_or_not("rax", node->left, file);
+
+  op_depth--;
 
   // Determine the operator type
   OperatorType oper_type = check_operator(node);
@@ -311,16 +327,34 @@ Node *generate_operator_code(Node *node, FILE *file)
   // Push result onto stack for later use
   push("rax", file);
 
-  // Detach processed nodes (avoid re-traversal)
-  node->left = NULL;
-  node->right = NULL;
+  // Return without detaching nodes - let parent handle cleanup
   return node;
 }
 
 void traverse_tree(Node *node, int is_left, FILE *file, int syscall_number)
 {
-  if (!node)
+  if (!node || !node->value)
     return;
+
+  static int debug_depth = 0;
+  static Node *last_processed = NULL;
+
+  // Prevent processing the same node twice
+  if (node == last_processed)
+  {
+    printf("WARNING: Attempting to process the same node twice, skipping to prevent recursion\n");
+    return;
+  }
+  last_processed = node;
+
+  debug_depth++;
+  printf("DEBUG: Node @ %p, value=%s, depth=%d\n", (void *)node, node->value, debug_depth);
+  if (debug_depth > 100) // Reduced from 1000 to catch issues earlier
+  {
+    printf("ERROR: Traverse_tree called too deeply (AST depth > 100), possible infinite recursion or cyclic tree.\n");
+    exit(1);
+  }
+  printf("Codegen: At node type=%d, value='%s', depth=%d\n", node->type, node->value, debug_depth);
 
   // Handle EXIT syscall
   if (strcmp(node->value, "EXIT") == 0)
@@ -611,10 +645,14 @@ void traverse_tree(Node *node, int is_left, FILE *file, int syscall_number)
   // Recurse
   traverse_tree(node->left, 1, file, syscall_number);
   traverse_tree(node->right, 0, file, syscall_number);
+  debug_depth--;
 }
 
 void generate_code(Node *root, char *filename)
 {
+  static int visited_nodes[1024] = {0}; // Track visited nodes
+  memset(visited_nodes, 0, sizeof(visited_nodes));
+
   // Map operators to instructions
   insert('-', "sub");
   insert('+', "add");
