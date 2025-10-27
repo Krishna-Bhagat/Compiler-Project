@@ -1,7 +1,8 @@
-#include "parserf.h"
 #ifndef GENERATOR_H_
 #define GENERATOR_H_
 
-void generate_code(Node *root, char *filename);
+#include "parserf.h"
+
+void generate_code(Node *root, const char *filename);
 
 #endif

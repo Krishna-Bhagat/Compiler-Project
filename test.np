@@ -1,5 +1,5 @@
 int a = 14;
-int b = 5;
-int c = a + b;
+int b = 7;
+int c = a * b;
 write(c);
 exit(3);

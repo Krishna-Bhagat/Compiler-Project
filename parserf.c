@@ -4,22 +4,103 @@
 #include <ctype.h>
 
 #include "lexerf.h"
+#include "parserf.h"
 
 #define MAX_CURLY_STACK_LENGTH 64
+#define MAX_TOKEN_DEPTH 1000
 
-typedef struct Node
+// Forward declarations of structures
+typedef struct
 {
-    char *value;
-    TokenType type;
-    struct Node *right;
-    struct Node *left;
-} Node;
+    Token *start;
+    Token *current;
+    size_t depth;
+    size_t max_depth;
+} TokenContext;
+
+// Global token context
+static TokenContext token_ctx = {0};
 
 typedef struct
 {
     Node *content[MAX_CURLY_STACK_LENGTH];
     int top;
 } curly_stack;
+
+// Global curly brace stack for tracking block nesting
+static curly_stack curly_stack_instance;
+
+// Forward declarations of functions
+void init_curly_stack(curly_stack *stack);
+Node *peek_curly(curly_stack *stack);
+void push_curly(curly_stack *stack, Node *element);
+Node *pop_curly(curly_stack *stack);
+void print_tree(Node *node, int indent, char *identifier);
+Node *init_node(Node *node, char *value, TokenType type, size_t line_num);
+void print_error(char *error_type, size_t line_number);
+void handle_token_errors(char *error_text, Token *current_token, TokenType type);
+Node *parse_expression(Token *current_token, Node *current_node);
+Token *generate_operation_nodes(Token *current_token, Node *current_node);
+Node *handle_exit_syscall(Node *root, Token *current_token, Node *current);
+Node *create_variable_reusage(Token *current_token, Node *current);
+Node *create_variables(Token *current_token, Node *current);
+Token *generate_if_operation_nodes(Token *current_token, Node *current_node);
+Token *generate_if_operation_nodes_right(Token *current_token, Node *current_node);
+Node *create_if_statement(Token *current_token, Node *current);
+Node *handle_write_node(Token *current_token, Node *current);
+Node *parser(Token *tokens);
+
+/* Token management functions */
+void init_token_context(Token *tokens)
+{
+    token_ctx.start = tokens;
+    token_ctx.current = tokens;
+    token_ctx.depth = 0;
+    token_ctx.max_depth = MAX_TOKEN_DEPTH;
+}
+
+Token *advance_token(void)
+{
+    if (!token_ctx.current || token_ctx.current->type == END_OF_TOKENS)
+    {
+        return NULL;
+    }
+
+    token_ctx.depth++;
+    if (token_ctx.depth > token_ctx.max_depth)
+    {
+        fprintf(stderr, "ERROR: Maximum parsing depth exceeded. Possible infinite loop at line %zu\n",
+                token_ctx.current->line_num);
+        exit(1);
+    }
+
+    token_ctx.current++;
+    return token_ctx.current;
+}
+
+Token *peek_next_token(void)
+{
+    if (!token_ctx.current || token_ctx.current->type == END_OF_TOKENS)
+    {
+        return NULL;
+    }
+    return token_ctx.current + 1;
+}
+
+Token *get_current_token(void)
+{
+    return token_ctx.current;
+}
+
+/* Allow updating the current token pointer (used after expression parsing helpers)
+ * This keeps the token context consistent across generator functions.
+ */
+void set_current_token(Token *token)
+{
+    if (!token)
+        return;
+    token_ctx.current = token;
+}
 
 /* Initialize a curly_stack (must be called before use) */
 void init_curly_stack(curly_stack *stack)
@@ -78,16 +159,36 @@ void print_tree(Node *node, int indent, char *identifier)
     print_tree(node->right, indent + 1, "right");
 }
 
-Node *init_node(Node *node, char *value, TokenType type)
+Node *init_node(Node *node, char *value, TokenType type, size_t line_num)
 {
     (void)node;
     node = malloc(sizeof(Node));
     if (!node)
     {
-        fprintf(stderr, "ERROR: Memory allocation failed\n");
+        fprintf(stderr, "ERROR: Memory allocation failed for node\n");
         exit(1);
     }
-    node->value = value; // reference lexer's token string
+
+    node->line_num = line_num; // Set the provided line number
+    node->right = NULL;
+    node->left = NULL;
+
+    // Duplicate the string value to prevent dangling pointers
+    if (value)
+    {
+        node->value = strdup(value);
+        if (!node->value)
+        {
+            free(node);
+            fprintf(stderr, "ERROR: Memory allocation failed for node value\n");
+            exit(1);
+        }
+    }
+    else
+    {
+        node->value = NULL;
+    }
+
     node->type = type;
     node->left = NULL;
     node->right = NULL;
@@ -102,304 +203,373 @@ void print_error(char *error_type, size_t line_number)
 
 Node *parse_expression(Token *current_token, Node *current_node)
 {
-    (void)current_node;
-    if (!current_token)
+    (void)current_node; // current_node is unused but kept for API compatibility
+
+    Token *token = get_current_token();
+    if (!token)
     {
         print_error("Unexpected NULL token", 0);
     }
-    if (!current_node)
-    {
-        print_error("Unexpected NULL node", 0);
-    }
 
     // First operand
-    if (current_token->type == END_OF_TOKENS)
-        return NULL;
-
-    Node *left = init_node(NULL, current_token->value, current_token->type);
-    current_token++;
-
-    while (current_token && current_token->type == OPERATOR)
+    if (token->type == END_OF_TOKENS)
     {
-        // Operator node
-        Node *op = init_node(NULL, current_token->value, current_token->type);
-        current_token++;
-
-        if (!current_token || current_token->type == END_OF_TOKENS)
-        {
-            /* malformed expression: no right operand */
-            print_error("Malformed expression (missing right operand)", 0);
-        }
-
-        // Right operand
-        Node *right = init_node(NULL, current_token->value, current_token->type);
-        current_token++;
-
-        // Attach children directly
-        op->left = left;
-        op->right = right;
-
-        // That operator node becomes the new "left" for the next iteration
-        left = op;
+        return NULL;
     }
 
-    return left; // final expression tree
+    // Create node for first operand
+    Node *left = init_node(NULL, token->value, token->type, token->line_num);
+    token = advance_token();
+
+    // Process operators and build expression tree
+    while (token && token->type == OPERATOR)
+    {
+        // Create operator node
+        Node *op = init_node(NULL, token->value, token->type, token->line_num);
+        token = advance_token();
+
+        if (!token || token->type == END_OF_TOKENS)
+        {
+            print_error("Malformed expression (missing right operand)", token_ctx.current->line_num);
+        }
+
+        // Create right operand node
+        Node *right = init_node(NULL, token->value, token->type, token->line_num);
+        token = advance_token();
+
+        // Build expression tree
+        op->left = left;
+        op->right = right;
+        left = op; // The operator becomes the new left node for next iteration
+    }
+
+    return left;
 }
 
 Token *generate_operation_nodes(Token *current_token, Node *current_node)
 {
-    if (!current_token || !current_node)
-        return current_token;
-    if (current_token->type == END_OF_TOKENS)
-        return current_token;
-    Node *oper_node = init_node(NULL, current_token->value, OPERATOR);
+    static int op_depth = 0;
+    op_depth++;
+
+    // Prevent deep recursion
+    if (op_depth > 10)
+    {
+        print_error("Expression too complex or recursive", token_ctx.current->line_num);
+    }
+
+    Token *token = get_current_token();
+    if (!token || !current_node)
+    {
+        return NULL;
+    }
+
+    if (token->type == END_OF_TOKENS)
+    {
+        return token;
+    }
+
+    // Create operator node (e.g., +, -, *, /)
+    Node *oper_node = init_node(NULL, token->value, OPERATOR, token->line_num);
     current_node->left = oper_node;
     current_node = oper_node;
 
-    // Move to previous token safely (for left operand)
-    // Instead of if (current_token > 0)
-    if (current_token != NULL && current_token != (Token *)-1)
-        current_token--;
-    else
-        print_error("Missing operand before operator", 0);
-
-    if (current_token && current_token->type == INT)
+    // Get the previous token for left operand (we'll restore position later)
+    Token *prev = token_ctx.current - 1;
+    if (!prev || prev < token_ctx.start)
     {
-        current_node->left = init_node(NULL, current_token->value, INT);
+        print_error("Missing operand before operator", token->line_num);
     }
-    else if (current_token && current_token->type == IDENTIFIER)
+
+    // Create left operand node
+    if (prev->type == INT || prev->type == IDENTIFIER)
     {
-        current_node->left = init_node(NULL, current_token->value, IDENTIFIER);
+        Node *left_operand = init_node(NULL, prev->value, prev->type, prev->line_num);
+        current_node->left = left_operand;
     }
     else
     {
-        printf("ERROR: expected int or identifier\n");
-        exit(1);
+        print_error("Expected integer or identifier before operator", prev->line_num);
     }
-    current_token++;
-    current_token++;
 
-    if (!current_token || current_token->type == END_OF_TOKENS)
-        return current_token;
-
-    /* If immediate operand is INT or IDENTIFIER, attach it as right child */
-    if (current_token->type == INT || current_token->type == IDENTIFIER)
+    // Move to next token after operator
+    token = advance_token();
+    if (!token || token->type == END_OF_TOKENS)
     {
-        current_node->right = init_node(NULL, current_token->value, current_token->type);
-        current_token++;
+        print_error("Unexpected end of expression", token_ctx.current->line_num);
+    }
+
+    // Handle right operand
+    if (token->type == INT || token->type == IDENTIFIER)
+    {
+        current_node->right = init_node(NULL, token->value, token->type, token->line_num);
+        token = advance_token();
     }
     else
     {
-        fprintf(stderr, "ERROR: expected INT or IDENTIFIER after operator\n");
-        exit(1);
+        print_error("Expected integer or identifier after operator", token->line_num);
     }
 
-    /* For simple expressions like a + b, we don't need to continue parsing */
-    /* Break after handling the first complete expression */
-    return current_token;
+    op_depth--;
+    return token;
 }
 
-Node *handle_exit_syscall(Node *root, Token *current_token, Node *current)
+Node *handle_exit_syscall(Node *root, Token *unused_token, Node *current)
 {
-    if (!current_token || current_token->type == END_OF_TOKENS)
-        return current;
-    Node *exit_node = init_node(NULL, current_token->value, KEYWORD);
-    if (current)
-        current->right = exit_node;
-    current = exit_node;
-    current_token++;
-    if (!current_token || current_token->type == END_OF_TOKENS)
-    {
-        print_error("Invalid Syntax on OPEN", current_token->line_num);
-    }
-    // Expect '('
-    if (!(current_token->type == SEPARATOR && strcmp(current_token->value, "(") == 0))
-        print_error("Expected '(' after 'exit'", current_token->line_num);
+    (void)unused_token; // Parameter kept for API compatibility
 
-    Node *open_paren_node = init_node(NULL, current_token->value, SEPARATOR);
+    Token *token = get_current_token();
+    if (!token || token->type == END_OF_TOKENS)
+    {
+        return current;
+    }
+
+    // Create and attach EXIT node
+    Node *exit_node = init_node(NULL, token->value, KEYWORD, token->line_num);
+    if (current)
+    {
+        current->right = exit_node;
+    }
+    current = exit_node;
+
+    // Expect '('
+    token = advance_token();
+    if (!token || token->type != SEPARATOR || strcmp(token->value, "(") != 0)
+    {
+        print_error("Expected '(' after 'exit'", token ? token->line_num : 0);
+    }
+
+    // Create open parenthesis node
+    Node *open_paren_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     current->left = open_paren_node;
     Node *expr_parent = open_paren_node;
-    current_token++;
-    if (!current_token || current_token->type == END_OF_TOKENS)
+
+    // Handle argument
+    token = advance_token();
+    if (!token || token->type == END_OF_TOKENS)
     {
-        print_error("Expected INT or IDENTIFIER inside 'exit()'", current_token->line_num);
+        print_error("Expected argument in exit()", token_ctx.current->line_num);
     }
-    if (current_token->type == INT || current_token->type == IDENTIFIER)
+
+    if (token->type == INT || token->type == IDENTIFIER)
     {
         // Simple argument (like exit(1);)
-        expr_parent->left = init_node(NULL, current_token->value, current_token->type);
-        current_token++;
+        expr_parent->left = init_node(NULL, token->value, token->type, token->line_num);
+        token = advance_token();
     }
-    else if (current_token->type == OPERATOR)
+    else if (token->type == OPERATOR)
     {
         // Expression like exit(a + b);
-        current_token = generate_operation_nodes(current_token, expr_parent);
+        token = generate_operation_nodes(token, expr_parent);
     }
     else
     {
-        print_error("Invalid argument inside 'exit()'", current_token->line_num);
+        print_error("Invalid argument in exit()", token->line_num);
     }
 
     // Expect ')'
-    if (!current_token || !(current_token->type == SEPARATOR && strcmp(current_token->value, ")") == 0))
-        print_error("Expected ')' after 'exit' argument", current_token->line_num);
+    if (!token || token->type != SEPARATOR || strcmp(token->value, ")") != 0)
+    {
+        print_error("Expected ')' after exit argument", token->line_num);
+    }
 
-    Node *close_paren_node = init_node(NULL, current_token->value, SEPARATOR);
+    Node *close_paren_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     expr_parent->right = close_paren_node;
 
-    current_token++;
-
     // Expect ';'
-    if (!current_token || !(current_token->type == SEPARATOR && strcmp(current_token->value, ";") == 0))
-        print_error("Expected ';' after 'exit()'", current_token->line_num);
+    token = advance_token();
+    if (!token || token->type != SEPARATOR || strcmp(token->value, ";") != 0)
+    {
+        print_error("Expected ';' after exit()", token->line_num);
+    }
 
-    Node *semi_node = init_node(NULL, current_token->value, SEPARATOR);
+    Node *semi_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     current->right = semi_node;
     current = semi_node;
 
     return current;
 }
 
-void handle_token_errors(char *error_text, Token *current_token, TokenType type)
+void handle_token_errors(char *error_text, Token *unused_token, TokenType expected_type)
 {
-    if (!current_token || current_token->type != type)
+    (void)unused_token; // Parameter kept for API compatibility
+
+    Token *token = get_current_token();
+    if (!token || token->type != expected_type)
     {
-        print_error(error_text, current_token->line_num);
+        print_error(error_text, token ? token->line_num : 0);
     }
 }
 
-Node *create_variable_reusage(Token *current_token, Node *current)
+Node *create_variable_reusage(Token *unused_token, Node *current)
 {
+    (void)unused_token; // Parameter kept for API compatibility
+
     static int depth = 0;
     if (depth > 50)
-    { // Prevent deep recursion
-        print_error("Expression too complex or possible recursion", 0);
+    {
+        print_error("Expression too complex or possible recursion", token_ctx.current->line_num);
     }
     depth++;
 
-    if (!current_token || !current)
-        print_error("Internal parser error: null token or node", 0);
+    Token *token = get_current_token();
+    if (!token || !current)
+    {
+        print_error("Internal parser error: null token or node", token ? token->line_num : 0);
+    }
 
-    if (!current_token->value)
-        print_error("Invalid token: missing value", 0);
+    if (!token->value)
+    {
+        print_error("Invalid token: missing value", token->line_num);
+    }
 
-    /* Create main identifier node and attach */
-    Node *main_identifier_node = init_node(NULL, current_token->value, IDENTIFIER);
+    // Create and attach identifier node
+    Node *main_identifier_node = init_node(NULL, token->value, IDENTIFIER, token->line_num);
     current->left = main_identifier_node;
     current = main_identifier_node;
 
-    /* Advance to token after identifier */
-    current_token++;
-    if (!current_token || current_token->type == END_OF_TOKENS)
-        print_error("Invalid syntax after identifier", current_token ? current_token->line_num : 0);
+    // Expect '=' operator
+    token = advance_token();
+    if (!token || token->type != OPERATOR || strcmp(token->value, "=") != 0)
+    {
+        print_error("Invalid Variable Syntax: expected '='", token ? token->line_num : 0);
+    }
 
-    /* Expect '=' operator */
-    if (current_token->type != OPERATOR || !current_token->value || strcmp(current_token->value, "=") != 0)
-        print_error("Invalid Variable Syntax: expected '='", current_token->line_num);
-
-    /* Create equals node and attach under identifier (right child keeps structure clear) */
-    Node *equals_node = init_node(NULL, current_token->value, OPERATOR);
+    // Create and attach equals node
+    Node *equals_node = init_node(NULL, token->value, OPERATOR, token->line_num);
     main_identifier_node->right = equals_node;
     current = equals_node;
 
-    /* Move to token after '=' */
-    current_token++;
-    if (!current_token || current_token->type == END_OF_TOKENS)
-        print_error("Invalid Syntax After Equals", current_token ? current_token->line_num : 0);
-
-    /* The next token should be an INT or IDENTIFIER (first operand) */
-    if (current_token->type != INT && current_token->type != IDENTIFIER)
-        print_error("Invalid Syntax After Equals: expected INT or IDENTIFIER", current_token->line_num);
-
-    /* Attach first operand as left child of equals */
-    Node *first_operand = init_node(NULL, current_token->value, current_token->type);
-    equals_node->left = first_operand;
-
-    /* Advance to token after first operand */
-    current_token++;
-    if (!current_token)
-        print_error("Unexpected end of tokens", 0);
-
-    /* If there's an operator after the first operand, build the operation chain */
-    if (current_token->type == OPERATOR)
+    // Get first operand (INT or IDENTIFIER)
+    token = advance_token();
+    if (!token || (token->type != INT && token->type != IDENTIFIER))
     {
-        /* We pass the operator token and the equals_node (whose left child is set) */
-        current_token = generate_operation_nodes(current_token, equals_node);
-
-        /* generate_operation_nodes returns the token after the operation chain */
-        if (!current_token || current_token->type == END_OF_TOKENS)
-            print_error("Invalid Syntax After Expression", current_token ? current_token->line_num : 0);
+        print_error("Invalid Syntax After Equals: expected INT or IDENTIFIER", token ? token->line_num : 0);
     }
 
-    /* At this point we expect a separator ';' */
-    if (current_token->type != SEPARATOR || !current_token->value || strcmp(current_token->value, ";") != 0)
-        print_error("Invalid Syntax After Expression: expected ';'", current_token->line_num);
+    // Create and attach first operand node
+    Node *first_operand = init_node(NULL, token->value, token->type, token->line_num);
+    equals_node->left = first_operand;
 
-    /* Create semicolon node and attach to the main identifier node's right (to mark statement end) */
-    Node *semi_node = init_node(NULL, current_token->value, SEPARATOR);
+    // Check for operator after first operand
+    token = advance_token();
+    if (!token)
+    {
+        print_error("Unexpected end of tokens", 0);
+    }
+
+    // Handle operation chain if present
+    if (token->type == OPERATOR)
+    {
+        token = generate_operation_nodes(token, equals_node);
+        if (!token)
+        {
+            print_error("Invalid syntax after expression", token_ctx.current->line_num);
+        }
+    }
+
+    // Expect semicolon
+    if (token->type != SEPARATOR || strcmp(token->value, ";") != 0)
+    {
+        print_error("Expected ';' after expression", token->line_num);
+    }
+
+    // Create and attach semicolon node
+    Node *semi_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     main_identifier_node->right = semi_node;
     current = semi_node;
 
+    // Reset recursion depth counter
+    depth--;
     return current;
 }
 
-Node *create_variables(Token *current_token, Node *current)
+Node *create_variables(Token *unused_token, Node *current)
 {
-    if (!current_token || !current)
-        print_error("Internal parser error: null token or node", 0);
+    (void)unused_token; // Parameter kept for API compatibility
 
-    /* Create variable keyword node (e.g. 'int') */
-    Node *var_node = init_node(NULL, current_token->value, KEYWORD);
+    static int var_count = 0;
+    Token *token = get_current_token();
+
+    // Safety checks
+    if (!token || !current)
+    {
+        print_error("Internal parser error: null token or node", token ? token->line_num : 0);
+    }
+
+    // Prevent excessive variable declarations
+    if (++var_count > 100)
+    {
+        print_error("Too many variable declarations", token->line_num);
+    }
+
+    // Check token context depth
+    if (token_ctx.depth > token_ctx.max_depth)
+    {
+        print_error("Possible infinite loop in variable creation", token->line_num);
+    }
+
+    // Create variable keyword node (e.g. 'int')
+    Node *var_node = init_node(NULL, token->value, KEYWORD, token->line_num);
     current->left = var_node;
     current = var_node;
 
-    /* Expect an identifier after 'int' */
-    current_token++;
-    handle_token_errors("Invalid syntax after type keyword", current_token, IDENTIFIER);
+    // Expect an identifier after 'int'
+    token = advance_token();
+    handle_token_errors("Invalid syntax after type keyword", NULL, IDENTIFIER);
 
-    Node *identifier_node = init_node(NULL, current_token->value, IDENTIFIER);
+    Node *identifier_node = init_node(NULL, token->value, IDENTIFIER, token->line_num);
     current->left = identifier_node;
     current = identifier_node;
 
-    /* Expect '=' */
-    current_token++;
-    handle_token_errors("Invalid syntax after identifier", current_token, OPERATOR);
+    // Expect '='
+    token = advance_token();
+    handle_token_errors("Invalid syntax after identifier", NULL, OPERATOR);
 
-    if (strcmp(current_token->value, "=") != 0)
-        print_error("Invalid variable syntax: expected '='", current_token->line_num);
+    if (strcmp(token->value, "=") != 0)
+    {
+        print_error("Invalid variable syntax: expected '='", token->line_num);
+    }
 
-    Node *equals_node = init_node(NULL, current_token->value, OPERATOR);
+    Node *equals_node = init_node(NULL, token->value, OPERATOR, token->line_num);
     identifier_node->left = equals_node;
     current = equals_node;
 
-    /* Expect value after '=' */
-    current_token++;
-    if (!current_token || current_token->type == END_OF_TOKENS)
-        print_error("Invalid syntax after '='", current_token ? current_token->line_num : 0);
-
-    if (current_token->type != INT && current_token->type != IDENTIFIER)
-        print_error("Expected value or identifier after '='", current_token->line_num);
-
-    /* Attach first operand */
-    Node *first_operand = init_node(NULL, current_token->value, current_token->type);
-    current->left = first_operand;
-
-    /* Check for further operations */
-    current_token++;
-    if (current_token && current_token->type == OPERATOR)
+    // Expect value after '='
+    token = advance_token();
+    if (!token || token->type == END_OF_TOKENS)
     {
-        current_token = generate_operation_nodes(current_token, current);
-
-        if (!current_token || current_token->type == END_OF_TOKENS)
-            print_error("Invalid syntax after expression", current_token ? current_token->line_num : 0);
+        print_error("Invalid syntax after '='", token ? token->line_num : 0);
     }
 
-    /* Expect ';' */
-    handle_token_errors("Expected ';' after expression", current_token, SEPARATOR);
+    if (token->type != INT && token->type != IDENTIFIER)
+    {
+        print_error("Expected value or identifier after '='", token->line_num);
+    }
 
-    Node *semi_node = init_node(NULL, current_token->value, SEPARATOR);
+    // Create and attach first operand node
+    Node *first_operand = init_node(NULL, token->value, token->type, token->line_num);
+    current->left = first_operand;
+
+    // Check for and handle any operations
+    token = advance_token();
+    if (token && token->type == OPERATOR)
+    {
+        token = generate_operation_nodes(token, current);
+        if (!token)
+        {
+            print_error("Invalid syntax after expression", token_ctx.current->line_num);
+        }
+    }
+
+    // Expect ';'
+    handle_token_errors("Expected ';' after expression", NULL, SEPARATOR);
+
+    // Create and attach semicolon node
+    Node *semi_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     var_node->right = semi_node;
 
+    // Cleanup and return
+    var_count--; // Decrement declaration count as we're done
     return semi_node;
 }
 
@@ -409,7 +579,7 @@ Token *generate_if_operation_nodes(Token *current_token, Node *current_node)
         print_error("Internal parser error in generate_if_operation_nodes", 0);
 
     /* Create operator node (e.g. <, >, ==) */
-    Node *oper_node = init_node(NULL, current_token->value, OPERATOR);
+    Node *oper_node = init_node(NULL, current_token->value, OPERATOR, current_token->line_num);
     current_node->left->left = oper_node;
 
     /* Go back to get left operand safely */
@@ -420,7 +590,7 @@ Token *generate_if_operation_nodes(Token *current_token, Node *current_node)
     if (!prev_token || prev_token->type == END_OF_TOKENS)
         print_error("Missing left operand in if-condition", current_token->line_num);
 
-    Node *left_expr = init_node(NULL, prev_token->value, prev_token->type);
+    Node *left_expr = init_node(NULL, prev_token->value, prev_token->type, prev_token->line_num);
     oper_node->left = left_expr;
 
     /* Move ahead to get right operand */
@@ -432,13 +602,13 @@ Token *generate_if_operation_nodes(Token *current_token, Node *current_node)
     {
         if (current_token->type == INT || current_token->type == IDENTIFIER)
         {
-            Node *right_expr = init_node(NULL, current_token->value, current_token->type);
+            Node *right_expr = init_node(NULL, current_token->value, current_token->type, current_token->line_num);
             oper_node->right = right_expr;
         }
         else if (current_token->type == OPERATOR && strcmp(current_token->value, "=") != 0)
         {
             /* Chain another operator if needed */
-            Node *next_oper = init_node(NULL, current_token->value, OPERATOR);
+            Node *next_oper = init_node(NULL, current_token->value, OPERATOR, current_token->line_num);
             oper_node->right = next_oper;
             oper_node = next_oper;
         }
@@ -459,7 +629,7 @@ Token *generate_if_operation_nodes_right(Token *current_token, Node *current_nod
         print_error("Internal parser error in generate_if_operation_nodes_right", 0);
 
     /* Create operator node (e.g. <, >, ==) */
-    Node *oper_node = init_node(NULL, current_token->value, OPERATOR);
+    Node *oper_node = init_node(NULL, current_token->value, OPERATOR, current_token->line_num);
     current_node->left->right = oper_node;
 
     /* Get left operand safely */
@@ -467,7 +637,7 @@ Token *generate_if_operation_nodes_right(Token *current_token, Node *current_nod
     if (!prev_token)
         print_error("Missing left operand in if-condition (right side)", 0);
 
-    Node *left_expr = init_node(NULL, prev_token->value, prev_token->type);
+    Node *left_expr = init_node(NULL, prev_token->value, prev_token->type, prev_token->line_num);
     oper_node->left = left_expr;
 
     /* Advance to get right operand(s) */
@@ -479,12 +649,12 @@ Token *generate_if_operation_nodes_right(Token *current_token, Node *current_nod
     {
         if (current_token->type == INT || current_token->type == IDENTIFIER)
         {
-            Node *right_expr = init_node(NULL, current_token->value, current_token->type);
+            Node *right_expr = init_node(NULL, current_token->value, current_token->type, current_token->line_num);
             oper_node->right = right_expr;
         }
         else if (current_token->type == OPERATOR && strcmp(current_token->value, "=") != 0)
         {
-            Node *next_oper = init_node(NULL, current_token->value, OPERATOR);
+            Node *next_oper = init_node(NULL, current_token->value, OPERATOR, current_token->line_num);
             oper_node->right = next_oper;
             oper_node = next_oper;
         }
@@ -498,80 +668,103 @@ Token *generate_if_operation_nodes_right(Token *current_token, Node *current_nod
     return current_token;
 }
 
-Node *create_if_statement(Token *current_token, Node *current)
+Node *create_if_statement(Token *unused_token, Node *current)
 {
-    if (!current_token || !current)
-        print_error("Internal parser error: null token or node in create_if_statement", 0);
+    (void)unused_token; // Parameter kept for API compatibility
 
-    /* Create IF node and attach */
-    Node *if_node = init_node(NULL, current_token->value, current_token->type);
+    Token *token = get_current_token();
+    if (!token || !current)
+    {
+        print_error("Internal parser error: null token or node in create_if_statement",
+                    token ? token->line_num : 0);
+    }
+
+    // Create IF node and attach
+    Node *if_node = init_node(NULL, token->value, token->type, token->line_num);
     current->left = if_node;
     current = if_node;
-    current_token++;
 
-    /* Expect '(' separator */
-    handle_token_errors("ERROR: Expected (", current_token, SEPARATOR);
+    // Expect '(' separator
+    token = advance_token();
+    handle_token_errors("Expected '(' after if", NULL, SEPARATOR);
 
-    Node *open_paren_node = init_node(NULL, current_token->value, SEPARATOR);
+    Node *open_paren_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     current->left = open_paren_node;
     current = open_paren_node;
 
-    current_token++;
-    if (!current_token || current_token->type == END_OF_TOKENS)
-        print_error("Invalid if condition: unexpected end", 0);
+    // Get first token of condition
+    token = advance_token();
+    if (!token || token->type == END_OF_TOKENS)
+    {
+        print_error("Invalid if condition: unexpected end", token_ctx.current->line_num);
+    }
 
-    /* First token in condition should be an identifier or int or a subexpression/operator */
-    if (!(current_token->type == IDENTIFIER || current_token->type == INT || current_token->type == OPERATOR))
-        print_error("ERROR: Expected Identifier or INT in if condition", current_token->line_num);
+    // Validate first token of condition
+    if (!(token->type == IDENTIFIER || token->type == INT || token->type == OPERATOR))
+    {
+        print_error("Expected identifier or integer in if condition", token->line_num);
+    }
 
-    /* Find comparator (COMP) token ahead (stop at END_OF_TOKENS) */
-    Token *scan = current_token;
-    while (scan && scan->type != END_OF_TOKENS && scan->type != COMP)
+    // Find comparator token
+    Token *scan = token_ctx.current;
+    size_t scan_depth = 0;
+    while (scan && scan->type != END_OF_TOKENS && scan->type != COMP && scan_depth < 100)
+    {
         scan++;
+        scan_depth++;
+    }
 
-    if (!scan || scan->type != COMP)
-        print_error("ERROR: Expected comparator in if condition", current_token->line_num);
+    if (!scan || scan->type != COMP || scan_depth >= 100)
+    {
+        print_error("Expected comparator in if condition", token->line_num);
+    }
 
-    /* Attach comparator node */
-    Node *comp_node = init_node(NULL, scan->value, scan->type);
+    // Create comparator node
+    Node *comp_node = init_node(NULL, scan->value, scan->type, scan->line_num);
     open_paren_node->left = comp_node;
 
-    /* Determine left-hand operand: scan backwards from COMP to first IDENTIFIER/INT */
-    Token *left_tok = scan;
-    while (left_tok && left_tok->type != END_OF_TOKENS && !(left_tok->type == INT || left_tok->type == IDENTIFIER))
+    // Find left operand of comparison
+    Token *left_tok = token; // Start from the first token of condition
+    while (left_tok && left_tok->type != END_OF_TOKENS &&
+           !(left_tok->type == INT || left_tok->type == IDENTIFIER))
     {
-        if (left_tok == current_token)
+        left_tok++;
+        if (left_tok >= scan)
+        {
             break;
-        left_tok--;
+        }
     }
+
     if (!left_tok || !(left_tok->type == INT || left_tok->type == IDENTIFIER))
-        print_error("ERROR: Expected left-hand operand for comparator", scan->line_num);
+    {
+        print_error("Expected left-hand operand for comparator", scan->line_num);
+    }
 
-    comp_node->left = init_node(NULL, left_tok->value, left_tok->type);
-
-    /* Now position at token immediately after COMP to parse right-hand side */
+    // Create and attach left operand node
+    comp_node->left = init_node(NULL, left_tok->value, left_tok->type, left_tok->line_num); /* Now position at token immediately after COMP to parse right-hand side */
     Token *right_start = scan + 1;
     if (!right_start || right_start->type == END_OF_TOKENS)
         print_error("ERROR: Unexpected end after comparator", scan->line_num);
 
-    /* If next token is INT/IDENTIFIER -> either simple right operand or expression if operator follows */
+    // If right operand is INT/IDENTIFIER, check for operation chain
     if (right_start->type == INT || right_start->type == IDENTIFIER)
     {
-        /* look ahead: if next token after right_start is OPERATOR, handle operation chain */
         Token *peek = right_start + 1;
         if (peek && peek->type == OPERATOR)
         {
-            /* pass peek (operator) and comp_node as the parent for operation nodes */
-            Token *after_ops = generate_if_operation_nodes(peek, comp_node);
-            /* If generate returned NULL or END_OF_TOKENS, that's an error */
-            if (!after_ops || after_ops->type == END_OF_TOKENS)
-                print_error("Invalid syntax after right-hand expression", right_start->line_num);
-            /* we don't need to update current_token here — parser's main loop advances separately */
+            // Handle operation chain starting with operator
+            token = generate_operation_nodes(peek, comp_node);
+            if (!token || token->type == END_OF_TOKENS)
+            {
+                print_error("Invalid right-hand expression", right_start->line_num);
+            }
+            // Update token_ctx with post-operation position
+            set_current_token(token);
         }
         else
         {
             /* simple right operand */
-            comp_node->right = init_node(NULL, right_start->value, right_start->type);
+            comp_node->right = init_node(NULL, right_start->value, right_start->type, right_start->line_num);
         }
     }
     else if (right_start->type == OPERATOR)
@@ -587,20 +780,27 @@ Node *create_if_statement(Token *current_token, Node *current)
         print_error("Invalid token after comparator in if condition", right_start->line_num);
     }
 
-    /* Find the closing ')' for the if condition */
-    Token *close_scan = scan + 1;
-    while (close_scan && close_scan->type != END_OF_TOKENS)
+    // Find closing parenthesis and open brace
+    token = advance_token();
+    if (!token || strcmp(token->value, ")") != 0)
     {
-        if (close_scan->type == SEPARATOR && close_scan->value && strcmp(close_scan->value, ")") == 0)
-            break;
-        close_scan++;
+        print_error("Expected closing parenthesis in if condition", token ? token->line_num : 0);
     }
-    if (!close_scan || close_scan->type == END_OF_TOKENS)
-        print_error("ERROR: Expected closing ')' in if condition", scan->line_num);
 
-    Node *close_paren_node = init_node(NULL, close_scan->value, SEPARATOR);
+    // Create and attach closing parenthesis node
+    Node *close_paren_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     open_paren_node->right = close_paren_node;
     current = close_paren_node;
+
+    // Look for opening brace
+    token = advance_token();
+    if (!token || strcmp(token->value, "{") != 0)
+    {
+        print_error("Expected opening brace for if body", token ? token->line_num : 0);
+    }
+
+    // Register if statement for brace matching
+    push_curly(&curly_stack_instance, if_node);
 
     return current;
 }
@@ -650,61 +850,58 @@ Node *create_if_statement(Token *current_token, Node *current)
 //     return current;
 // }
 
-Node *handle_write_node(Token *current_token, Node *current)
+Node *handle_write_node(Token *unused_token, Node *current)
 {
-    if (!current_token || !current)
-        print_error("Internal parser error: null token in handle_write_node", 0);
+    (void)unused_token; // keep API consistent
 
-    // Create write node
-    Node *write_node = init_node(NULL, current_token->value, current_token->type);
+    Token *token = get_current_token();
+    if (!token || !current)
+        print_error("Internal parser error: null token in handle_write_node", token ? token->line_num : 0);
+
+    // Create write node and attach
+    Node *write_node = init_node(NULL, token->value, token->type, token->line_num);
     current->left = write_node;
     current = write_node;
-    current_token++;
 
     // Expect '('
-    if (!current_token || current_token->type != SEPARATOR || !current_token->value || strcmp(current_token->value, "(") != 0)
-        print_error("ERROR: Expected '(' after write", current_token ? current_token->line_num : 0);
-
-    Node *open_paren_node = init_node(NULL, current_token->value, SEPARATOR);
+    token = advance_token();
+    handle_token_errors("ERROR: Expected (' after write", NULL, SEPARATOR);
+    Node *open_paren_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     current->left = open_paren_node;
     Node *arg_parent = open_paren_node;
 
-    current_token++;
+    // Move to argument
+    token = advance_token();
+    if (!token || (token->type != STRING && token->type != IDENTIFIER))
+        print_error("ERROR: Expected String literal or Identifier inside write()", token ? token->line_num : 0);
 
-    // Expect STRING or IDENTIFIER
-    if (!current_token || (current_token->type != STRING && current_token->type != IDENTIFIER))
-        print_error("ERROR: Expected String literal or Identifier inside write()", current_token ? current_token->line_num : 0);
-
-    Node *arg1_node = init_node(NULL, current_token->value, current_token->type);
+    Node *arg1_node = init_node(NULL, token->value, token->type, token->line_num);
     arg_parent->left = arg1_node;
-    current_token++;
+
+    // Advance to next token
+    token = advance_token();
 
     // Optional comma for second argument
-    if (current_token && current_token->type == SEPARATOR && current_token->value && strcmp(current_token->value, ",") == 0)
+    if (token && token->type == SEPARATOR && token->value && strcmp(token->value, ",") == 0)
     {
-        current_token++; // skip comma
+        token = advance_token(); // move to second arg
+        if (!token || (token->type != INT && token->type != IDENTIFIER))
+            print_error("ERROR: Expected Number or Identifier after ',' in write()", token ? token->line_num : 0);
 
-        if (!current_token || (current_token->type != INT && current_token->type != IDENTIFIER))
-            print_error("ERROR: Expected Number or Identifier after ',' in write()", current_token ? current_token->line_num : 0);
-
-        Node *arg2_node = init_node(NULL, current_token->value, current_token->type);
+        Node *arg2_node = init_node(NULL, token->value, token->type, token->line_num);
         arg_parent->right = arg2_node;
-        current_token++;
+        token = advance_token();
     }
 
     // Expect ')'
-    if (!current_token || current_token->type != SEPARATOR || !current_token->value || strcmp(current_token->value, ")") != 0)
-        print_error("ERROR: Expected ')' after write arguments", current_token ? current_token->line_num : 0);
-
-    Node *close_paren_node = init_node(NULL, current_token->value, SEPARATOR);
+    handle_token_errors("ERROR: Expected ')' after write arguments", NULL, SEPARATOR);
+    Node *close_paren_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     open_paren_node->right = close_paren_node;
-    current_token++;
 
     // Expect ';'
-    if (!current_token || current_token->type != SEPARATOR || !current_token->value || strcmp(current_token->value, ";") != 0)
-        print_error("ERROR: Expected ';' after write()", current_token ? current_token->line_num : 0);
-
-    Node *semi_node = init_node(NULL, current_token->value, SEPARATOR);
+    token = advance_token();
+    handle_token_errors("ERROR: Expected ';' after write()", NULL, SEPARATOR);
+    Node *semi_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
     current->right = semi_node;
     current = semi_node;
 
@@ -714,105 +911,129 @@ Node *handle_write_node(Token *current_token, Node *current)
 Node *parser(Token *tokens)
 {
     if (!tokens)
+    {
         print_error("Parser received NULL tokens", 0);
+    }
 
-    Token *current_token = tokens;
-    Node *root = init_node(NULL, "PROGRAM", BEGINNING);
+    // Initialize token tracking
+    init_token_context(tokens);
+    Token *token = get_current_token();
+
+    // Initialize the AST
+    Node *root = init_node(NULL, "PROGRAM", BEGINNING, 0);
     Node *current = root;
     Node *open_curly = NULL;
 
-    curly_stack *stack = malloc(sizeof(curly_stack));
-    if (!stack)
-    {
-        printf("ERROR: malloc failed\n");
-        exit(1);
-    }
-    init_curly_stack(stack);
+    // Initialize global curly brace tracking
+    init_curly_stack(&curly_stack_instance);
 
-    while (current_token->type != END_OF_TOKENS)
+    while (token && token->type != END_OF_TOKENS)
     {
         if (!current)
+        {
             break;
+        }
 
-        switch (current_token->type)
+        // Safety check for parsing depth
+        if (token_ctx.depth > token_ctx.max_depth)
+        {
+            print_error("Too many tokens or possible infinite loop", token->line_num);
+        }
+
+        switch (token->type)
         {
         case KEYWORD:
-            if (current_token->value)
+            if (token->value)
             {
-                if (strcmp(current_token->value, "EXIT") == 0)
+                if (strcmp(token->value, "EXIT") == 0)
                 {
-                    current = handle_exit_syscall(root, current_token, current);
+                    current = handle_exit_syscall(root, token, current);
+                    token = get_current_token();
                 }
-                else if (strcmp(current_token->value, "INT") == 0)
+                else if (strcmp(token->value, "INT") == 0)
                 {
-                    current = create_variables(current_token, current);
+                    current = create_variables(token, current);
+                    token = get_current_token();
                 }
-                else if (strcmp(current_token->value, "IF") == 0)
+                else if (strcmp(token->value, "IF") == 0)
                 {
-                    current = create_if_statement(current_token, current);
+                    current = create_if_statement(token, current);
+                    token = get_current_token();
                 }
-                else if (strcmp(current_token->value, "WHILE") == 0)
+                else if (strcmp(token->value, "WHILE") == 0)
                 {
-                    // Create a specialized WHILE node but reuse IF condition parsing logic
-                    Node *while_node = init_node(NULL, current_token->value, current_token->type);
+                    Node *while_node = init_node(NULL, token->value, token->type, token->line_num);
                     current->left = while_node;
-                    current = create_if_statement(current_token, while_node);
+                    current = create_if_statement(token, while_node);
+                    token = get_current_token();
                 }
-                else if (strcmp(current_token->value, "WRITE") == 0)
+                else if (strcmp(token->value, "WRITE") == 0)
                 {
-                    current = handle_write_node(current_token, current);
+                    current = handle_write_node(token, current);
+                    token = get_current_token();
                 }
             }
             break;
 
         case SEPARATOR:
-            if (current_token->value && strcmp(current_token->value, "{") == 0)
+            if (token->value && strcmp(token->value, "{") == 0)
             {
-                Node *open_curly_node = init_node(NULL, current_token->value, SEPARATOR);
+                Node *open_curly_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
                 current->right = open_curly_node;
-                push_curly(stack, open_curly_node);
+                push_curly(&curly_stack_instance, open_curly_node);
                 current = open_curly_node;
+                token = advance_token();
             }
-            else if (current_token->value && strcmp(current_token->value, "}") == 0)
+            else if (token->value && strcmp(token->value, "}") == 0)
             {
-                open_curly = pop_curly(stack);
+                open_curly = pop_curly(&curly_stack_instance);
                 if (!open_curly)
                 {
-                    print_error("ERROR: Unexpected closing brace '}'", current_token->line_num);
+                    print_error("Unexpected closing brace '}'", token->line_num);
                 }
-                Node *close_curly_node = init_node(NULL, current_token->value, SEPARATOR);
+                Node *close_curly_node = init_node(NULL, token->value, SEPARATOR, token->line_num);
                 open_curly->right = close_curly_node;
                 current = close_curly_node;
+                token = advance_token();
+            }
+            else
+            {
+                token = advance_token(); // Skip other separators
             }
             break;
 
         case IDENTIFIER:
-            if (current_token != tokens)
+        {
+            // Get previous token if there is one
+            Token *prev = NULL;
+            if (token_ctx.current > token_ctx.start)
             {
-                Token *prev = current_token - 1;
-                if (prev->type == SEPARATOR &&
-                    (strcmp(prev->value, ";") == 0 || strcmp(prev->value, "{") == 0 || strcmp(prev->value, "}") == 0))
-                {
-                    current = create_variable_reusage(current_token, current);
-                }
+                prev = token_ctx.current - 1;
             }
-            break;
+
+            // Check if this identifier starts a new statement
+            if (prev && prev->type == SEPARATOR &&
+                (strcmp(prev->value, ";") == 0 ||
+                 strcmp(prev->value, "{") == 0 ||
+                 strcmp(prev->value, "}") == 0))
+            {
+                current = create_variable_reusage(token, current);
+            }
+            token = advance_token();
+        }
+        break;
 
         default:
-            // Other token types can be ignored or handled separately if needed
-            current_token++; // Advance token for unhandled types
+            token = advance_token(); // Skip unhandled token types
             break;
         }
 
-        // Special handling to advance token for non-keyword/non-separator tokens
-        if (current_token->type != KEYWORD && current_token->type != SEPARATOR &&
-            current_token->type != IDENTIFIER)
+        // Safety check - if we haven't moved forward, force advance
+        if (token == get_current_token())
         {
-            current_token++;
+            token = advance_token();
         }
     }
 
-    // Clean up stack before returning
-    free(stack);
     return root;
 }

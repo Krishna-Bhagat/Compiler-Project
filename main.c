@@ -17,7 +17,7 @@ int main(int argc, char *argv[])
     char *output_filename = "generated.asm";
 
     FILE *file;
-    file = fopen(argv[1], "r");
+    file = fopen(argv[1], "rb");
 
     if (file == NULL)
     {
@@ -32,6 +32,8 @@ int main(int argc, char *argv[])
     }
 
     Node *test = parser(tokens);
+    // Debug: print AST for inspection
+    print_tree(test, 0, "ROOT");
     generate_code(test, output_filename);
     FILE *assembly_file = fopen(output_filename, "r");
     if (assembly_file == NULL)

@@ -56,6 +56,19 @@ void print_token(Token token)
   }
 }
 
+void cleanup_tokens(Token *tokens)
+{
+  if (!tokens)
+    return;
+  Token *current = tokens;
+  while (current->type != END_OF_TOKENS)
+  {
+    free(current->value);
+    current++;
+  }
+  free(tokens);
+}
+
 Token *generate_number(char *current, int *current_index)
 {
   Token *token = malloc(sizeof(Token));
@@ -117,55 +130,55 @@ Token *generate_keyword_or_identifier(char *current, int *current_index)
   if (strcmp(keyword, "exit") == 0)
   {
     token->type = KEYWORD;
-    token->value = "EXIT";
+    token->value = strdup("EXIT");
     free(keyword);
   }
   else if (strcmp(keyword, "int") == 0)
   {
     token->type = KEYWORD;
-    token->value = "INT";
+    token->value = strdup("INT");
     free(keyword);
   }
   else if (strcmp(keyword, "if") == 0)
   {
     token->type = KEYWORD;
-    token->value = "IF";
+    token->value = strdup("IF");
     free(keyword);
   }
   else if (strcmp(keyword, "while") == 0)
   {
     token->type = KEYWORD;
-    token->value = "WHILE";
+    token->value = strdup("WHILE");
     free(keyword);
   }
   else if (strcmp(keyword, "write") == 0)
   {
     token->type = KEYWORD;
-    token->value = "WRITE";
+    token->value = strdup("WRITE");
     free(keyword);
   }
   else if (strcmp(keyword, "eq") == 0)
   {
     token->type = COMP;
-    token->value = "EQ";
+    token->value = strdup("EQ");
     free(keyword);
   }
   else if (strcmp(keyword, "neq") == 0)
   {
     token->type = COMP;
-    token->value = "NEQ";
+    token->value = strdup("NEQ");
     free(keyword);
   }
   else if (strcmp(keyword, "less") == 0)
   {
     token->type = COMP;
-    token->value = "LESS";
+    token->value = strdup("LESS");
     free(keyword);
   }
   else if (strcmp(keyword, "greater") == 0)
   {
     token->type = COMP;
-    token->value = "GREATER";
+    token->value = strdup("GREATER");
     free(keyword);
   }
   else
@@ -249,88 +262,199 @@ Token *generate_separator_or_operator(char *current, int *current_index, TokenTy
   return token;
 }
 
-size_t tokens_index;
-
 Token *lexer(FILE *file)
 {
+  if (!file)
+    return NULL;
+
   fseek(file, 0, SEEK_END);
   long length = ftell(file);
   fseek(file, 0, SEEK_SET);
 
-  char *current = malloc(length + 1); // ✅ +1 for null terminator
-  if (!current)
+  char *buf = malloc(length + 1);
+  if (!buf)
     return NULL;
+  if (fread(buf, 1, length, file) != (size_t)length)
+  {
+    // continue even if partial
+  }
+  buf[length] = '\0';
 
-  fread(current, 1, length, file);
-  fclose(file);
-
-  current[length] = '\0';
-
-  int current_index = 0;
-  size_t number_of_tokens = 12;
-  size_t tokens_size = 0;
-  Token *tokens = malloc(sizeof(Token) * number_of_tokens);
+  size_t capacity = 64;
+  size_t count = 0;
+  Token *tokens = malloc(sizeof(Token) * capacity);
   if (!tokens)
   {
-    free(current);
+    free(buf);
     return NULL;
   }
 
-  tokens_index = 0;
-
-  while (current[current_index] != '\0')
+  int i = 0;
+  while (buf[i] != '\0')
   {
-    Token *token = NULL;
+    char c = buf[i];
 
-    tokens_size++;
-    if (tokens_size > number_of_tokens)
+    // Skip whitespace
+    if (c == ' ' || c == '\t' || c == '\r')
     {
-      number_of_tokens = (size_t)(number_of_tokens * 1.5);
-      tokens = realloc(tokens, sizeof(Token) * number_of_tokens);
-      if (!tokens)
-      {
-        free(current);
-        return NULL;
-      }
+      i++;
+      continue;
     }
-
-    if (strchr(";(),{}=+-*/%", current[current_index]))
-    {
-      token = generate_separator_or_operator(current, &current_index,
-                                             strchr("=+-*/%", current[current_index]) ? OPERATOR : SEPARATOR);
-    }
-    else if (current[current_index] == '"')
-    {
-      token = generate_string_token(current, &current_index);
-    }
-    else if (isdigit((unsigned char)current[current_index]))
-    {
-      token = generate_number(current, &current_index);
-      current_index--; // adjust because generate_number advanced index
-    }
-    else if (isalpha((unsigned char)current[current_index]))
-    {
-      token = generate_keyword_or_identifier(current, &current_index);
-      current_index--; // adjust similarly
-    }
-    else if (current[current_index] == '\n')
+    if (c == '\n')
     {
       line_number++;
+      i++;
+      continue;
     }
 
-    if (token)
+    // Ensure capacity
+    if (count + 2 >= capacity)
     {
-      tokens[tokens_index++] = *token; // shallow copy
-      free(token);                     // free struct only, not its value
+      capacity *= 2;
+      Token *tmp = realloc(tokens, sizeof(Token) * capacity);
+      if (!tmp)
+      { /* cleanup */
+        while (count--)
+          free(tokens[count].value);
+        free(tokens);
+        free(buf);
+        return NULL;
+      }
+      tokens = tmp;
     }
 
-    current_index++;
+    Token tk = {0};
+    tk.line_num = line_number;
+
+    if (isalpha((unsigned char)c) || c == '_')
+    {
+      int start = i;
+      while (isalpha((unsigned char)buf[i]) || buf[i] == '_')
+        i++;
+      int len = i - start;
+      char *s = malloc(len + 1);
+      memcpy(s, buf + start, len);
+      s[len] = '\0';
+      // keywords
+      if (strcmp(s, "exit") == 0)
+      {
+        tk.type = KEYWORD;
+        free(s);
+        tk.value = strdup("EXIT");
+      }
+      else if (strcmp(s, "int") == 0)
+      {
+        tk.type = KEYWORD;
+        free(s);
+        tk.value = strdup("INT");
+      }
+      else if (strcmp(s, "if") == 0)
+      {
+        tk.type = KEYWORD;
+        free(s);
+        tk.value = strdup("IF");
+      }
+      else if (strcmp(s, "while") == 0)
+      {
+        tk.type = KEYWORD;
+        free(s);
+        tk.value = strdup("WHILE");
+      }
+      else if (strcmp(s, "write") == 0)
+      {
+        tk.type = KEYWORD;
+        free(s);
+        tk.value = strdup("WRITE");
+      }
+      else if (strcmp(s, "eq") == 0)
+      {
+        tk.type = COMP;
+        free(s);
+        tk.value = strdup("EQ");
+      }
+      else if (strcmp(s, "neq") == 0)
+      {
+        tk.type = COMP;
+        free(s);
+        tk.value = strdup("NEQ");
+      }
+      else if (strcmp(s, "less") == 0)
+      {
+        tk.type = COMP;
+        free(s);
+        tk.value = strdup("LESS");
+      }
+      else if (strcmp(s, "greater") == 0)
+      {
+        tk.type = COMP;
+        free(s);
+        tk.value = strdup("GREATER");
+      }
+      else
+      {
+        tk.type = IDENTIFIER;
+        tk.value = s;
+      }
+      tokens[count++] = tk;
+      continue;
+    }
+
+    if (isdigit((unsigned char)c))
+    {
+      int start = i;
+      while (isdigit((unsigned char)buf[i]))
+        i++;
+      int len = i - start;
+      char *s = malloc(len + 1);
+      memcpy(s, buf + start, len);
+      s[len] = '\0';
+      tk.type = INT;
+      tk.value = s;
+      tokens[count++] = tk;
+      continue;
+    }
+
+    if (c == '"')
+    {
+      i++;
+      int start = i;
+      while (buf[i] != '\0' && buf[i] != '"')
+        i++;
+      int len = i - start;
+      char *s = malloc(len + 1);
+      memcpy(s, buf + start, len);
+      s[len] = '\0';
+      if (buf[i] == '"')
+        i++;
+      tk.type = STRING;
+      tk.value = s;
+      tokens[count++] = tk;
+      continue;
+    }
+
+    // separators and operators
+    if (strchr(";(),{}=+-*/%", c))
+    {
+      char *s = malloc(2);
+      s[0] = c;
+      s[1] = '\0';
+      tk.value = s;
+      if (strchr("=+-*/%", c))
+        tk.type = OPERATOR;
+      else
+        tk.type = SEPARATOR;
+      tokens[count++] = tk;
+      i++;
+      continue;
+    }
+
+    // Unknown char: skip
+    i++;
   }
 
-  // Add END_OF_TOKENS sentinel
-  tokens[tokens_index].value = NULL; // ✅ better than '\0'
-  tokens[tokens_index].type = END_OF_TOKENS;
-
-  free(current);
+  // sentinel
+  tokens[count].type = END_OF_TOKENS;
+  tokens[count].value = NULL;
+  free(buf);
   return tokens;
 }

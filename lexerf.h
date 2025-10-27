@@ -1,8 +1,9 @@
 #ifndef LEXER_H_
 #define LEXER_H_
 
-typedef enum{
-    BEGINNING, 
+typedef enum
+{
+    BEGINNING,
     INT,
     KEYWORD,
     IDENTIFIER,
@@ -10,10 +11,10 @@ typedef enum{
     OPERATOR,
     STRING,
     COMP,
-    END_OF_TOKENS,  
+    END_OF_TOKENS,
 } TokenType;
 
-typedef struct 
+typedef struct
 {
     TokenType type;
     char *value;
@@ -22,8 +23,9 @@ typedef struct
 
 void print_token(Token token);
 Token *generate_number(char *current, int *current_index);
-Token *generate_keyword(char *current, int *current_index); 
+Token *generate_keyword(char *current, int *current_index);
 Token *generate_separator_or_operator(char *current, int *current_index, TokenType type);
-Token *lexer(FILE *file);  
+Token *lexer(FILE *file);
+void cleanup_tokens(Token *tokens);
 
 #endif
