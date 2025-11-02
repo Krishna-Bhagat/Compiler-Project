@@ -10,11 +10,15 @@ main:
   mov rbp, rsp
   sub rsp, 24
   mov QWORD [rbp - 8], 14
-  mov QWORD [rbp - 16], 7
+  mov QWORD [rbp - 16], 5
   mov rax, QWORD [rbp - 8]
   mov rbx, QWORD [rbp - 16]
-  ; Multiply operation
-  imul rbx
+  ; Modulo operation
+  cqo
+  test rbx, rbx
+  jz div_by_zero
+  idiv rbx
+  mov rax, rdx
   push rax
   pop rax
   mov QWORD [rbp - 24], rax
@@ -24,6 +28,14 @@ main:
   mov rdi, format_string_label
   xor rax, rax
   call printf
+
+; --- Division by zero handler ---
+section .text
+div_by_zero:
+  ; exit(1) via linux syscall
+  mov rax, 60
+  mov rdi, 1
+  syscall
   mov rax, 3
   mov rdi, rax
 end_program:

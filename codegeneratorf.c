@@ -1515,6 +1515,15 @@ void generate_code(Node *root, const char *filename)
   visited_count_global = 0;
   process_program(root, file);
 
+  // Emit division-by-zero handler (no output)
+  fprintf(file, "\n; --- Division by zero handler ---\n");
+  fprintf(file, "section .text\n");
+  fprintf(file, "div_by_zero:\n");
+  fprintf(file, "  ; exit(1) via linux syscall\n");
+  fprintf(file, "  mov rax, 60\n");
+  fprintf(file, "  mov rdi, 1\n");
+  fprintf(file, "  syscall\n");
+
   /* Emit a single exit syscall at program end. If an EXIT was seen during
      traversal we jump to label `end_program` and the generator will emit a
      label here which performs the syscall without overriding rdi (so the
