@@ -81,6 +81,13 @@ static int loop_label_number = 0;
 static int text_label = 0;
 /* Guard to ensure we only emit a single exit syscall when generating code */
 static int exit_emitted = 0;
+/* Track string literals for emission in data section */
+#define MAX_STRING_LITERALS 10000
+static struct {
+  char label[32];
+  char value[MAX_STRING_LENGTH];
+} string_literals[MAX_STRING_LITERALS];
+static int string_literal_count = 0;
 /* If an EXIT is encountered during traversal we store the argument node here
   and emit the actual exit code at the end of the generated program so that
   it runs after all other statements (e.g., WRITE). */
@@ -601,14 +608,14 @@ OperatorType check_operator(Node *node)
 
 int mov_if_var_or_not(char *reg, Node *node, FILE *file)
 {
-  printf("DEBUG: mov_if_var_or_not called with node=%p, type=%d\n",
-         (void *)node, node ? node->type : -1);
+  // printf("DEBUG: mov_if_var_or_not called with node=%p, type=%d\n",
+  //        (void *)node, node ? node->type : -1);
   if (node == NULL)
   {
     SAFE_EXIT("Null node passed to mov_if_var_or_not");
   }
 
-  printf("DEBUG: Node value='%s', type=%d\n", node->value, node->type);
+  // printf("DEBUG: Node value='%s', type=%d\n", node->value, node->type);
 
   if (node->type == IDENTIFIER)
   {
@@ -765,8 +772,8 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
 
   debug_depth++;
 
-  printf("DEBUG: Processing node @ %p, type=%d, value='%s', depth=%d\n",
-         (void *)node, node->type, node->value, debug_depth);
+  // printf("DEBUG: Processing node @ %p, type=%d, value='%s', depth=%d\n",
+  //        (void *)node, node->type, node->value, debug_depth);
 
   // Track line number for error reporting
   current_line_num = node->line_num;
@@ -784,7 +791,7 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
   if ((node->type == INT || (node->value && strcmp(node->value, "INT") == 0)) && node->left && node->left->type == IDENTIFIER)
   {
     const char *var_name = node->left->value;
-    printf("DEBUG: Found INT declaration for '%s'\n", var_name);
+    // printf("DEBUG: Found INT declaration for '%s'\n", var_name);
 
     // First, declare the variable before evaluating initialization
     size_t *cur_size = malloc(sizeof(size_t));
@@ -830,7 +837,7 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
     if (node->left->left && node->left->left->left)
     {
       Node *value_node = node->left->left->left;
-      printf("DEBUG: Processing initialization for '%s'\n", var_name);
+      // printf("DEBUG: Processing initialization for '%s'\n", var_name);
       if (value_node->type == INT)
       {
         fprintf(file, "  mov QWORD [rbp - %zu], %s\n", *slot, value_node->value);
@@ -877,7 +884,7 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
   // arithmetic/compare operators with this branch.
   if (node->type == OPERATOR && strcmp(node->value, "=") != 0)
   {
-    printf("DEBUG: Processing operator '%s'\n", node->value);
+    // printf("DEBUG: Processing operator '%s'\n", node->value);
     traverse_tree(node->left, 1, file, syscall_number);
     traverse_tree(node->right, 0, file, syscall_number);
     generate_operator_code(node, file);
@@ -890,16 +897,20 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
   // Handle PROGRAM and semicolon nodes
   if (strcmp(node->value, ";") == 0 || strcmp(node->value, "PROGRAM") == 0)
   {
-    // These nodes chain statements together
+    // These nodes chain statements - traverse them in order
     traverse_tree(node->left, 1, file, syscall_number);
     traverse_tree(node->right, 0, file, syscall_number);
+    debug_depth--;
+    if (depth > 0)
+      depth--;
+    return;
   }
 
   // Update current line number for error reporting
   current_line_num = node->line_num;
 
-  // Traverse child nodes (depth-first)
-  if (node->type != INT) // We handle INT specially above
+  // Traverse child nodes (depth-first) - but NOT for WRITE which we handle above
+  if (node->type != INT && strcmp(node->value, "WRITE") != 0)
   {
     traverse_tree(node->left, 1, file, syscall_number);
     traverse_tree(node->right, 0, file, syscall_number);
@@ -914,7 +925,10 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
        generated program to exit prematurely. */
     if (exit_emitted)
     {
-      printf("DEBUG: EXIT already emitted; skipping duplicate at line %zu\n", node->line_num);
+      // printf("DEBUG: EXIT already emitted; skipping duplicate at line %zu\n", node->line_num);
+      debug_depth--;
+      if (depth > 0)
+        depth--;
       return;
     }
     exit_emitted = 1;
@@ -927,6 +941,16 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
 
       /* Defer evaluation of the exit argument until the end of codegen */
       exit_node_arg = arg;
+      
+      /* Mark all EXIT children as visited to prevent processing */
+      if (visited_count_global < 10000 && node->left)
+      {
+        visited_nodes_global[visited_count_global++] = (void *)node->left;
+        if (node->left->left && visited_count_global < 10000)
+          visited_nodes_global[visited_count_global++] = (void *)node->left->left;
+        if (node->left->right && visited_count_global < 10000)
+          visited_nodes_global[visited_count_global++] = (void *)node->left->right;
+      }
     }
     else
     {
@@ -935,6 +959,9 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
     }
 
     /* We do not emit assembly for exit now; it will be emitted once at the end */
+    debug_depth--;
+    if (depth > 0)
+      depth--;
     return;
   }
 
@@ -956,7 +983,7 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
     if (value->type == IDENTIFIER)
     {
       size_t key_len = strlen(value->value);
-      printf("DEBUG: Lookup identifier '%s' (len=%zu)\n", value->value, key_len);
+      // printf("DEBUG: Lookup identifier '%s' (len=%zu)\n", value->value, key_len);
       // Make a persistent copy of the key for consistent lookups
       char *lookup_key = strdup(value->value);
       if (!lookup_key)
@@ -985,7 +1012,7 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
       exit(1);
     }
 
-    printf("DEBUG: INT node variable name = '%s'\n", node->left ? node->left->value : "NULL");
+    // printf("DEBUG: INT node variable name = '%s'\n", node->left ? node->left->value : "NULL");
     size_t *cur_size = malloc(sizeof(size_t));
     if (!cur_size)
     {
@@ -1009,8 +1036,8 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
       free(cur_size);
       SAFE_EXIT("Memory allocation failed for variable name");
     }
-    printf("DEBUG: Inserting variable '%s' (len=%zu) at stack pos %zu\n", key, put_len, *cur_size);
-    printf("DEBUG: Insert key bytes: ");
+    // printf("DEBUG: Inserting variable '%s' (len=%zu) at stack pos %zu\n", key, put_len, *cur_size);
+    // printf("DEBUG: Insert key bytes: ");
     for (size_t i = 0; i < put_len && i < 8; i++)
     {
       printf("%02x ", (unsigned char)key[i]);
@@ -1024,7 +1051,7 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
     {
       // The variable is already present (likely inserted by the pre-declare
       // path). Free our temporary allocation and continue without error.
-      printf("DEBUG: Variable '%s' already exists; skipping insertion\n", var_name);
+      // printf("DEBUG: Variable '%s' already exists; skipping insertion\n", var_name);
       free(key);
       free(cur_size);
     }
@@ -1125,18 +1152,12 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
   // Handle WRITE statements
   if (strcmp(node->value, "WRITE") == 0)
   {
-    /* The parser creates a structure like:
-       WRITE -> '(' -> arg
-       so node->left may be the '(' separator node. Unwrap it to get the real arg.
-    */
     Node *arg = node->left;
     if (arg && arg->type == SEPARATOR && arg->value && strcmp(arg->value, "(") == 0)
     {
-      /* argument is stored as left child of the '(' node */
       arg = arg->left;
     }
 
-    // Debug: indicate we've reached a WRITE node during generation
     if (arg)
     {
       if (arg->type == IDENTIFIER)
@@ -1165,12 +1186,6 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
                 arg->value, arg->line_num ? arg->line_num : 0);
         exit(1);
       }
-      /* Load variable from rbp-relative slot into rsi, set format in rdi and call printf.
-         Ensure stack alignment: on entry after 'push rbp; mov rbp,rsp; sub rsp, total' the
-         rsp is 16*n - 8 typically; to be safe we will not push extra values; calling
-         printf requires RSP % 16 == 8 before call on System V, so we adjust only if needed.
-         For simplicity we emit no additional pushes here and assume prologue preserved alignment.
-      */
       fprintf(file, "  mov rsi, QWORD [rbp - %zu]\n", *var_addr);
       fprintf(file, "  mov rdi, format_string_label\n");
       fprintf(file, "  xor rax, rax\n");
@@ -1185,16 +1200,16 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
     }
     else if (arg->type == STRING)
     {
-      if (text_label >= 10000)
+      if (string_literal_count >= MAX_STRING_LITERALS)
       {
-        fprintf(stderr, "ERROR: Too many string literals (max 10000)\n");
+        fprintf(stderr, "ERROR: Too many string literals (max %d)\n", MAX_STRING_LITERALS);
         exit(1);
       }
       char label[32];
-      snprintf(label, sizeof(label), "str_label_%d", text_label++);
-      fprintf(file, "section .data\n");
-      fprintf(file, "%s: db \"%s\", 10, 0\n", label, arg->value);
-      fprintf(file, "section .text\n");
+      snprintf(label, sizeof(label), "str_label_%d", string_literal_count);
+      snprintf(string_literals[string_literal_count].label, sizeof(string_literals[string_literal_count].label), "%s", label);
+      snprintf(string_literals[string_literal_count].value, sizeof(string_literals[string_literal_count].value), "%s", arg->value);
+      string_literal_count++;
       fprintf(file, "  lea rdi, [%s]\n", label);
       fprintf(file, "  xor rax, rax\n");
       fprintf(file, "  call printf\n");
@@ -1373,9 +1388,9 @@ static void traverse_tree(Node *node, int is_left, FILE *file, int syscall_numbe
       traverse_tree(node->left, 1, file, syscall_number);
     }
   }
-  else
+  else if (strcmp(node->value, "EXIT") != 0 && strcmp(node->value, "WRITE") != 0)
   {
-    // For other nodes, evaluate both sides
+    // For other nodes, evaluate both sides (but not EXIT or WRITE which handle their own children)
     traverse_tree(node->left, 1, file, syscall_number);
     traverse_tree(node->right, 0, file, syscall_number);
   }
@@ -1389,8 +1404,8 @@ static void process_program(Node *n, FILE *f)
 {
   if (!n || !n->value)
     return;
-  printf("PP: visiting node @ %p value='%s'\n", (void *)n, n->value ? n->value : "(null)");
-  printf("PP: node @ %p left=%p right=%p\n", (void *)n, (void *)n->left, (void *)n->right);
+  // printf("PP: visiting node @ %p value='%s'\n", (void *)n, n->value ? n->value : "(null)");
+  // printf("PP: node @ %p left=%p right=%p\n", (void *)n, (void *)n->left, (void *)n->right);
   if (strcmp(n->value, "PROGRAM") == 0 || strcmp(n->value, ";") == 0)
   {
     process_program(n->left, f);
@@ -1398,17 +1413,9 @@ static void process_program(Node *n, FILE *f)
   }
   else
   {
-    /* Generate code for this node, then continue walking possible
-       statement chains attached to its right child (common AST shape
-       for sequences). We call traverse_tree for the node itself which
-       will mark it visited; subsequent recursive calls will skip already
-       visited nodes. */
     traverse_tree(n, 0, f, 0);
-    /* If this node chains another statement via its right pointer,
-       make sure to process it as well. */
+    // Also process right child which may contain more statements
     process_program(n->right, f);
-    /* Also process left subtree in case it contains nested statements */
-    process_program(n->left, f);
   }
 }
 
@@ -1449,6 +1456,7 @@ void generate_code(Node *root, const char *filename)
   // Reset tracking variables
   variable_count = 0;
   scope_depth = 0;
+  string_literal_count = 0;
 
   // Initialize hashmap with validation
   if (initial_size > MAX_VARIABLES)
@@ -1478,6 +1486,10 @@ void generate_code(Node *root, const char *filename)
   // ----------------------------
   fprintf(file, "section .data\n");
   fprintf(file, "  format_string_label: db \"%%d\", 10, 0\n"); // for printf
+  
+  // Emit string literals collected during traversal
+  // Note: We do a pre-pass first to collect them
+  // For now, we'll emit them after the main traversal
 
   // ----------------------------
   // BSS SECTION
@@ -1502,18 +1514,54 @@ void generate_code(Node *root, const char *filename)
     size_t next_offset = 8; /* start at rbp-8 */
     assign_variable_offsets(root, &next_offset);
     size_t total_bytes = next_offset > 8 ? (next_offset - 8) : 0;
+    /* Align to 16 bytes for System V ABI */
     if (total_bytes > 0)
     {
+      if (total_bytes % 16 != 0)
+        total_bytes = ((total_bytes / 16) + 1) * 16;
       fprintf(file, "  sub rsp, %zu\n", total_bytes);
       /* Remember reserved space if needed elsewhere */
       stack_size += (total_bytes / 8);
     }
   }
 
-  // Reset traversal visited set and traverse the top-level statements
+  // Reset traversal visited set
   memset(visited_nodes_global, 0, sizeof(visited_nodes_global));
   visited_count_global = 0;
+  
+  // Pre-pass: mark EXIT argument nodes as visited to prevent code generation for them                                     
+  void mark_exit_args(Node *n) {               
+    if (!n) return;
+    if (n->value && strcmp(n->value, "EXIT") == 0) {
+      if (n->left && visited_count_global < 10000) {
+        visited_nodes_global[visited_count_global++] = (void *)n->left;
+        if (n->left->left && visited_count_global < 10000)
+          visited_nodes_global[visited_count_global++] = (void *)n->left->left;
+        if (n->left->right && visited_count_global < 10000)
+          visited_nodes_global[visited_count_global++] = (void *)n->left->right;
+      }
+    }
+    mark_exit_args(n->left);
+    mark_exit_args(n->right);
+  }
+  mark_exit_args(root);
+  
+  // Traverse the top-level statements
   process_program(root, file);
+  
+  // Jump to exit handling
+  fprintf(file, "  jmp end_program\n");
+  
+  // Now emit all collected string literals in data section
+  if (string_literal_count > 0)
+  {
+    fprintf(file, "\nsection .data\n");
+    for (int i = 0; i < string_literal_count; i++)
+    {
+      fprintf(file, "%s: db \"%s\", 10, 0\n", string_literals[i].label, string_literals[i].value);
+    }
+    fprintf(file, "section .text\n");
+  }
 
   // Emit division-by-zero handler (no output)
   fprintf(file, "\n; --- Division by zero handler ---\n");
@@ -1529,6 +1577,7 @@ void generate_code(Node *root, const char *filename)
      label here which performs the syscall without overriding rdi (so the
      requested exit code is preserved). If no EXIT was emitted, write the
      normal exit sequence with status 0. */
+  fprintf(file, "end_program:\n");
   if (exit_emitted)
   {
     /* Generate code to evaluate the stored exit argument (if any) at the
@@ -1540,7 +1589,7 @@ void generate_code(Node *root, const char *filename)
          operator code and pop the result into rax. */
       if (exit_node_arg->type == INT)
       {
-        fprintf(file, "  mov rax, %s\n", exit_node_arg->value);
+        fprintf(file, "  mov rdi, %s\n", exit_node_arg->value);
       }
       else if (exit_node_arg->type == IDENTIFIER)
       {
@@ -1548,37 +1597,32 @@ void generate_code(Node *root, const char *filename)
         if (!var_pos)
           SAFE_EXIT("Variable %s used in exit() is not declared", exit_node_arg->value);
         push_var(*var_pos, exit_node_arg->value, file);
-        pop("rax", file);
+        pop("rdi", file);
       }
       else if (exit_node_arg->type == OPERATOR)
       {
         generate_operator_code(exit_node_arg, file);
-        pop("rax", file);
+        pop("rdi", file);
       }
       else
       {
         /* Fallback: default to 0 */
-        fprintf(file, "  mov rax, 0\n");
+        fprintf(file, "  xor rdi, rdi\n");
       }
-
-      /* Move computed exit value to rdi for syscall */
-      fprintf(file, "  mov rdi, rax\n");
     }
     else
     {
       /* No argument supplied; default to 0 */
-      fprintf(file, "  mov rdi, 0\n");
+      fprintf(file, "  xor rdi, rdi\n");
     }
-
-    fprintf(file, "end_program:\n");
     fprintf(file, "  mov rax, 60       ; syscall: exit\n");
     fprintf(file, "  syscall\n");
   }
   else
   {
     /* No explicit EXIT call; default to exit(0) */
-    fprintf(file, "  mov rax, 60       ; syscall: exit\n");
     fprintf(file, "  xor rdi, rdi      ; status 0\n");
+    fprintf(file, "  mov rax, 60       ; syscall: exit\n");
     fprintf(file, "  syscall\n");
   }
 
